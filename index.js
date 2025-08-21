@@ -6,7 +6,6 @@ const { MongoStore } = require('wwebjs-mongo');
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const path = require('path');
 
 // Express app setup
 const app = express();
@@ -23,14 +22,31 @@ let botStatus = {
   authenticated: false,
   ready: false,
   qrCode: null,
-  lastActivity: null,
+  lastPollSent: null,
+  nextPollTime: null,
   error: null
 };
 
-// Serve static files
-app.use(express.static(path.join(__dirname, 'public')));
+// Calculate next 10 AM
+function getNext10AM() {
+  const now = new Date();
+  const next10AM = new Date();
+  next10AM.setHours(10, 0, 0, 0);
+  
+  // If it's already past 10 AM today, schedule for tomorrow
+  if (now > next10AM) {
+    next10AM.setDate(next10AM.getDate() + 1);
+  }
+  
+  return next10AM;
+}
 
-// API endpoints
+// Update next poll time
+function updateNextPollTime() {
+  botStatus.nextPollTime = getNext10AM();
+}
+
+// Serve dashboard
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -38,12 +54,12 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>WhatsApp Bot Dashboard</title>
+        <title>WhatsApp Daily Poll Bot</title>
         <script src="/socket.io/socket.io.js"></script>
         <style>
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                max-width: 1200px;
+                max-width: 1000px;
                 margin: 0 auto;
                 padding: 20px;
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -70,7 +86,7 @@ app.get('/', (req, res) => {
             
             .status-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
                 gap: 20px;
                 margin-bottom: 30px;
             }
@@ -83,21 +99,12 @@ app.get('/', (req, res) => {
                 border-left: 4px solid #ddd;
             }
             
-            .status-card.connected {
-                border-left-color: #28a745;
-            }
-            
-            .status-card.authenticated {
-                border-left-color: #007bff;
-            }
-            
             .status-card.ready {
                 border-left-color: #25D366;
             }
             
-            .status-card.error {
-                border-left-color: #dc3545;
-                background: #fff5f5;
+            .status-card.schedule {
+                border-left-color: #ffc107;
             }
             
             .status-indicator {
@@ -137,24 +144,13 @@ app.get('/', (req, res) => {
                 box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             }
             
-            .logs {
-                background: #1e1e1e;
-                color: #00ff00;
-                padding: 20px;
+            .schedule-info {
+                background: #fff3cd;
+                border: 1px solid #ffeaa7;
                 border-radius: 10px;
-                max-height: 400px;
-                overflow-y: auto;
-                font-family: 'Courier New', monospace;
-                font-size: 14px;
-                line-height: 1.4;
-            }
-            
-            .log-entry {
-                margin-bottom: 5px;
-            }
-            
-            .log-timestamp {
-                color: #888;
+                padding: 20px;
+                margin: 20px 0;
+                text-align: center;
             }
             
             .actions {
@@ -173,15 +169,6 @@ app.get('/', (req, res) => {
                 transition: all 0.3s;
             }
             
-            .btn-primary {
-                background: #007bff;
-                color: white;
-            }
-            
-            .btn-primary:hover {
-                background: #0056b3;
-            }
-            
             .btn-success {
                 background: #28a745;
                 color: white;
@@ -191,59 +178,74 @@ app.get('/', (req, res) => {
                 background: #1e7e34;
             }
             
-            .btn-danger {
-                background: #dc3545;
-                color: white;
+            .logs {
+                background: #1e1e1e;
+                color: #00ff00;
+                padding: 20px;
+                border-radius: 10px;
+                max-height: 300px;
+                overflow-y: auto;
+                font-family: 'Courier New', monospace;
+                font-size: 14px;
+                line-height: 1.4;
             }
             
-            .btn-danger:hover {
-                background: #c82333;
+            .privacy-notice {
+                background: #d4edda;
+                border: 1px solid #c3e6cb;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 20px 0;
+                text-align: center;
             }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
-                <h1>🤖 WhatsApp Bot Dashboard</h1>
-                <p>Real-time monitoring and control</p>
+                <h1>📅 Daily Poll Bot</h1>
+                <p>Sends polls every day at 10:00 AM</p>
+            </div>
+            
+            <div class="privacy-notice">
+                <strong>🔒 Privacy-First Bot</strong><br>
+                This bot only sends messages - it does NOT read your conversations
             </div>
             
             <div class="status-grid">
-                <div class="status-card" id="connection-status">
-                    <h3><span class="status-indicator" id="conn-indicator"></span>Connection</h3>
-                    <p id="conn-text">Disconnected</p>
+                <div class="status-card ready" id="bot-status">
+                    <h3><span class="status-indicator" id="bot-indicator"></span>Bot Status</h3>
+                    <p id="bot-text">Not Ready</p>
                 </div>
                 
-                <div class="status-card" id="auth-status">
-                    <h3><span class="status-indicator" id="auth-indicator"></span>Authentication</h3>
-                    <p id="auth-text">Not Authenticated</p>
+                <div class="status-card schedule" id="schedule-status">
+                    <h3><span class="status-indicator active"></span>Next Poll</h3>
+                    <p id="next-poll-text">Calculating...</p>
                 </div>
                 
-                <div class="status-card" id="ready-status">
-                    <h3><span class="status-indicator" id="ready-indicator"></span>Bot Status</h3>
-                    <p id="ready-text">Not Ready</p>
+                <div class="status-card" id="last-sent-status">
+                    <h3><span class="status-indicator" id="last-indicator"></span>Last Sent</h3>
+                    <p id="last-sent-text">Never</p>
                 </div>
-                
-                <div class="status-card" id="activity-status">
-                    <h3><span class="status-indicator" id="activity-indicator"></span>Last Activity</h3>
-                    <p id="activity-text">Never</p>
-                </div>
+            </div>
+            
+            <div class="schedule-info">
+                <h3>⏰ Schedule</h3>
+                <p><strong>Daily at 10:00 AM</strong> - "Meet availability" poll will be sent automatically</p>
+                <p><small>Bot timezone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}</small></p>
             </div>
             
             <div class="qr-section" id="qr-section" style="display: none;">
                 <h3>📱 Scan QR Code with WhatsApp</h3>
                 <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
                 <div class="qr-code" id="qr-container"></div>
-                <p><small>QR Code will refresh automatically if needed</small></p>
             </div>
             
             <div class="actions">
-                <button class="btn btn-success" onclick="sendTestPoll()">📊 Send Test Poll</button>
-                <button class="btn btn-primary" onclick="refreshStatus()">🔄 Refresh Status</button>
-                <button class="btn btn-danger" onclick="restartBot()">🔄 Restart Bot</button>
+                <button class="btn btn-success" onclick="sendTestPoll()">📊 Send Test Poll Now</button>
             </div>
             
-            <h3>📋 Live Logs</h3>
+            <h3>📋 Activity Log</h3>
             <div class="logs" id="logs"></div>
         </div>
 
@@ -263,53 +265,36 @@ app.get('/', (req, res) => {
             });
             
             function updateStatus(status) {
-                // Connection status
-                const connIndicator = document.getElementById('conn-indicator');
-                const connText = document.getElementById('conn-text');
-                if (status.connected) {
-                    connIndicator.classList.add('active');
-                    connText.textContent = 'Connected';
-                    document.getElementById('connection-status').classList.add('connected');
-                } else {
-                    connIndicator.classList.remove('active');
-                    connText.textContent = 'Disconnected';
-                    document.getElementById('connection-status').classList.remove('connected');
-                }
-                
-                // Auth status
-                const authIndicator = document.getElementById('auth-indicator');
-                const authText = document.getElementById('auth-text');
-                if (status.authenticated) {
-                    authIndicator.classList.add('active');
-                    authText.textContent = 'Authenticated';
-                    document.getElementById('auth-status').classList.add('authenticated');
-                } else {
-                    authIndicator.classList.remove('active');
-                    authText.textContent = 'Not Authenticated';
-                    document.getElementById('auth-status').classList.remove('authenticated');
-                }
-                
-                // Ready status
-                const readyIndicator = document.getElementById('ready-indicator');
-                const readyText = document.getElementById('ready-text');
+                // Bot status
+                const botIndicator = document.getElementById('bot-indicator');
+                const botText = document.getElementById('bot-text');
                 if (status.ready) {
-                    readyIndicator.classList.add('active');
-                    readyText.textContent = 'Ready & Online';
-                    document.getElementById('ready-status').classList.add('ready');
+                    botIndicator.classList.add('active');
+                    botText.textContent = 'Ready & Online';
+                    document.getElementById('bot-status').classList.add('ready');
                 } else {
-                    readyIndicator.classList.remove('active');
-                    readyText.textContent = 'Not Ready';
-                    document.getElementById('ready-status').classList.remove('ready');
+                    botIndicator.classList.remove('active');
+                    botText.textContent = 'Not Ready';
+                    document.getElementById('bot-status').classList.remove('ready');
                 }
                 
-                // Last activity
-                const activityText = document.getElementById('activity-text');
-                if (status.lastActivity) {
-                    activityText.textContent = new Date(status.lastActivity).toLocaleString();
-                    document.getElementById('activity-indicator').classList.add('active');
+                // Next poll time
+                const nextPollText = document.getElementById('next-poll-text');
+                if (status.nextPollTime) {
+                    const nextTime = new Date(status.nextPollTime);
+                    nextPollText.textContent = nextTime.toLocaleString();
+                }
+                
+                // Last sent
+                const lastSentText = document.getElementById('last-sent-text');
+                const lastIndicator = document.getElementById('last-indicator');
+                if (status.lastPollSent) {
+                    const lastTime = new Date(status.lastPollSent);
+                    lastSentText.textContent = lastTime.toLocaleString();
+                    lastIndicator.classList.add('active');
                 } else {
-                    activityText.textContent = 'Never';
-                    document.getElementById('activity-indicator').classList.remove('active');
+                    lastSentText.textContent = 'Never';
+                    lastIndicator.classList.remove('active');
                 }
                 
                 // Hide QR if authenticated
@@ -329,38 +314,25 @@ app.get('/', (req, res) => {
             function addLog(log) {
                 const logs = document.getElementById('logs');
                 const entry = document.createElement('div');
-                entry.className = 'log-entry';
-                entry.innerHTML = '<span class="log-timestamp">[' + new Date().toLocaleTimeString() + ']</span> ' + log;
+                entry.innerHTML = '<span style="color: #888;">[' + new Date().toLocaleTimeString() + ']</span> ' + log;
                 logs.appendChild(entry);
                 logs.scrollTop = logs.scrollHeight;
                 
-                // Keep only last 100 logs
-                while (logs.children.length > 100) {
+                // Keep only last 50 logs
+                while (logs.children.length > 50) {
                     logs.removeChild(logs.firstChild);
                 }
             }
             
             function sendTestPoll() {
                 socket.emit('sendTestPoll');
-                addLog('🔄 Test poll requested...');
+                addLog('📊 Test poll requested...');
             }
             
-            function refreshStatus() {
-                socket.emit('getStatus');
-                addLog('🔄 Status refresh requested...');
-            }
-            
-            function restartBot() {
-                if (confirm('Are you sure you want to restart the bot?')) {
-                    socket.emit('restart');
-                    addLog('🔄 Bot restart requested...');
-                }
-            }
-            
-            // Auto-refresh status every 30 seconds
+            // Auto-refresh status every 60 seconds
             setInterval(() => {
                 socket.emit('getStatus');
-            }, 30000);
+            }, 60000);
             
             // Initial status load
             socket.emit('getStatus');
@@ -368,10 +340,6 @@ app.get('/', (req, res) => {
     </body>
     </html>
   `);
-});
-
-app.get('/api/status', (req, res) => {
-  res.json(botStatus);
 });
 
 // Socket.IO connections
@@ -386,37 +354,64 @@ io.on('connection', (socket) => {
   
   socket.on('sendTestPoll', async () => {
     if (client && botStatus.ready) {
-      try {
-        const poll = new Poll("Test Poll", ["Yes", "No"], { allowMultipleAnswers: false });
-        await client.sendMessage(groupId, poll);
-        socket.emit('log', '✅ Test poll sent successfully!');
-        botStatus.lastActivity = new Date();
-      } catch (error) {
-        socket.emit('log', '❌ Error sending test poll: ' + error.message);
-      }
+      await sendDailyPoll(true);
     } else {
       socket.emit('log', '⚠️ Bot not ready yet!');
     }
   });
-  
-  socket.on('restart', () => {
-    socket.emit('log', '🔄 Restarting bot...');
-    process.exit(1); // Let Render restart the service
-  });
 });
+
+// Optimized poll sending function
+async function sendDailyPoll(isTest = false) {
+  if (!client || !botStatus.ready) {
+    console.log('⚠️ Bot not ready to send poll');
+    return false;
+  }
+
+  try {
+    const startTime = Date.now();
+    const pollType = isTest ? "Test Poll" : "Ready for a meet today?";
+    
+    console.log(`📊 Sending ${pollType}...`);
+    io.emit('log', `📊 Sending ${pollType}...`);
+    
+    const poll = new Poll(pollType, ["Yes", "No"], { 
+      allowMultipleAnswers: false 
+    });
+    
+    await client.sendMessage(groupId, poll);
+    
+    const duration = Date.now() - startTime;
+    console.log(`✅ ${pollType} sent successfully in ${duration}ms`);
+    io.emit('log', `✅ ${pollType} sent in ${duration}ms`);
+    
+    if (!isTest) {
+      botStatus.lastPollSent = new Date();
+      updateNextPollTime();
+    }
+    
+    io.emit('status', botStatus);
+    return true;
+    
+  } catch (error) {
+    console.error('❌ Error sending poll:', error);
+    io.emit('log', '❌ Error sending poll: ' + error.message);
+    return false;
+  }
+}
 
 // MongoDB and WhatsApp Client setup
 let client;
 
 mongoose.connect(mongoUri).then(() => {
-  console.log("Connected to MongoDB");
+  console.log("✅ Connected to MongoDB");
   io.emit('log', '✅ Connected to MongoDB');
   
   const store = new MongoStore({ mongoose: mongoose });
   
   client = new Client({
     authStrategy: new RemoteAuth({
-      clientId: 'whatsapp-bot',
+      clientId: 'daily-poll-bot',
       store: store,
       backupSyncIntervalMs: 300000
     }),
@@ -431,14 +426,17 @@ mongoose.connect(mongoUri).then(() => {
     },
   });
 
+  // IMPORTANT: No message event listeners for privacy and performance
+  // This bot will NEVER read incoming messages
+
   client.on("qr", async (qr) => {
-    console.log("📲 QR Code received");
+    console.log("📲 QR Code generated");
     botStatus.qrCode = qr;
     
     try {
       const qrImage = await qrcode.toDataURL(qr);
       io.emit('qr', qrImage);
-      io.emit('log', '📲 New QR code generated - scan with your phone');
+      io.emit('log', '📲 Scan QR code with your phone');
     } catch (err) {
       console.error('Error generating QR code:', err);
     }
@@ -449,7 +447,7 @@ mongoose.connect(mongoUri).then(() => {
     botStatus.authenticated = true;
     botStatus.qrCode = null;
     io.emit('status', botStatus);
-    io.emit('log', '🔑 WhatsApp authenticated successfully!');
+    io.emit('log', '🔑 WhatsApp authenticated!');
   });
 
   client.on("auth_failure", (msg) => {
@@ -464,32 +462,24 @@ mongoose.connect(mongoUri).then(() => {
     console.log("✅ WhatsApp Bot is ready!");
     botStatus.ready = true;
     botStatus.connected = true;
-    botStatus.lastActivity = new Date();
+    updateNextPollTime();
     io.emit('status', botStatus);
-    io.emit('log', '✅ WhatsApp Bot is ready and online!');
+    io.emit('log', '✅ Daily Poll Bot is ready!');
 
-    // Schedule poll every hour
-    cron.schedule("0 * * * *", async () => {
-      try {
-        console.log("⏰ Sending scheduled poll...");
-        io.emit('log', '⏰ Sending scheduled poll...');
-        
-        const poll = new Poll("Meet availability", ["Yes", "No"], { allowMultipleAnswers: false });
-        await client.sendMessage(groupId, poll);
-        
-        console.log("📊 Poll sent successfully");
-        botStatus.lastActivity = new Date();
-        io.emit('status', botStatus);
-        io.emit('log', '📊 Scheduled poll sent successfully!');
-      } catch (err) {
-        console.error("Error sending poll:", err);
-        io.emit('log', '❌ Error sending scheduled poll: ' + err.message);
-      }
+    // Schedule daily poll at 10:00 AM
+    cron.schedule("0 10 * * *", async () => {
+      console.log("⏰ Daily poll time - 10:00 AM");
+      io.emit('log', '⏰ Daily poll time - 10:00 AM');
+      await sendDailyPoll(false);
+    }, {
+      timezone: "Asia/Kolkata" // Change to your timezone
     });
+
+    io.emit('log', '📅 Daily poll scheduled for 10:00 AM');
   });
 
   client.on("disconnected", (reason) => {
-    console.log("⚠️ Client disconnected:", reason);
+    console.log("⚠️ Disconnected:", reason);
     botStatus.connected = false;
     botStatus.ready = false;
     io.emit('status', botStatus);
@@ -499,11 +489,11 @@ mongoose.connect(mongoUri).then(() => {
   client.initialize();
 
 }).catch(err => {
-  console.error("MongoDB connection failed:", err);
+  console.error("❌ MongoDB connection failed:", err);
   botStatus.error = err.message;
   io.emit('log', '❌ MongoDB connection failed: ' + err.message);
 });
 
 server.listen(PORT, () => {
-  console.log(`🌐 Dashboard running on port ${PORT}`);
+  console.log(`🌐 Daily Poll Bot running on port ${PORT}`);
 });
